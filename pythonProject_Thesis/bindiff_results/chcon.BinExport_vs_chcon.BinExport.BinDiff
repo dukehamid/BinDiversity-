@@ -1,0 +1,10 @@
+BinDiff 7 (@377901646, Jun  7 2021), (c)2004-2011 zynamics GmbH, (c)2011-2021 Google LLC.
+Setup: 0.0s
+primary:   chcon: 398 functions, 720 calls
+secondary: chcon: 414 functions, 836 calls
+Matching: 0.1s
+matched: 396 of 398/414 (primary/secondary, 317/332 non-library)
+call graph MD index: primary   11.6134
+                     secondary 11.3114
+Similarity: 72.6404% (Confidence: 94.7857%)
+Writing results: 0.0s
