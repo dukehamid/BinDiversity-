@@ -1,104 +1,142 @@
 import os
+import subprocess
 import pandas as pd
+import numpy as np
+from sklearn.manifold import MDS
 import matplotlib.pyplot as plt
 import seaborn as sns
-import sqlite3
+import re
 
-# Set the base path to the current working directory
-base_path = os.path.abspath(os.getcwd())
+# Set the base path to the Desktop
+base_path = os.path.join(os.path.expanduser("~"), "Desktop")
 
-# Directory for BinDiff results
-bindiff_results_dir = os.path.join(base_path, 'bindiff_results')
+# List of directories containing the compiled results
+directories = [
+    'coreutils-7/bin',
+    'coreutils-7-CFLAGS-O1/bin',
+    'coreutils-7cflags03/bin',
+    'coreutils-9-cflagsO1/bin',
+    'coreutils-9-cflagsO3/bin',
+    'coreutils-gcc_9/bin'
+]
 
-# SQLite database setup
-db_path = os.path.join(base_path, 'similarity_scores.db')
-conn = sqlite3.connect(db_path)
-c = conn.cursor()
+# Function to run BinDiff and capture output
+def run_bindiff(primary, secondary, output_dir):
+    output_file = os.path.join(output_dir, f'{os.path.basename(primary)}_vs_{os.path.basename(secondary)}.BinDiff')
+    cmd = f'bindiff --primary {primary} --secondary {secondary} --output_dir {output_dir}'
+    print(f"Running: {cmd}")  # Debug statement
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error running BinDiff: {result.stderr}")
+    return output_file, result.stdout, result.stderr
 
-# Function to check if a column exists in a table
-def column_exists(cursor, table_name, column_name):
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    columns = [info[1] for info in cursor.fetchall()]
-    return column_name in columns
+# Function to extract similarity scores from BinDiff log output
+def extract_similarity_score(output_content):
+    match = re.search(r'Similarity: ([0-9]+\.[0-9]+)%', output_content)
+    if match:
+        return float(match.group(1))
+    return None
 
-# Ensure the similarity_scores table has the correct schema
-c.execute('''CREATE TABLE IF NOT EXISTS similarity_scores
-             (filename TEXT, function_name TEXT, similarity REAL)''')
-conn.commit()
+# Create output directory for BinDiff results
+output_dir = os.path.join(base_path, 'bindiff_results')
+os.makedirs(output_dir, exist_ok=True)
 
-# Add the 'filename' column if it doesn't exist
-if not column_exists(c, 'similarity_scores', 'filename'):
-    c.execute('ALTER TABLE similarity_scores ADD COLUMN filename TEXT')
-    conn.commit()
-
-# Function to read BinDiff SQLite result files and extract similarity scores
-def extract_similarity_scores_from_sqlite(result_file):
-    scores = []
-    try:
-        with sqlite3.connect(result_file) as db_conn:
-            query = "SELECT name1, similarity FROM function"
-            df = pd.read_sql_query(query, db_conn)
-            for index, row in df.iterrows():
-                scores.append((row['name1'], row['similarity']))
-    except sqlite3.Error as e:
-        print(f"SQLite error: {e}")
-    return scores
-
-# Process each result file in the bindiff_results directory
-for result_file in os.listdir(bindiff_results_dir):
-    if '.BinExport' not in result_file:
-        result_path = os.path.join(bindiff_results_dir, result_file)
-        scores = extract_similarity_scores_from_sqlite(result_path)
-        if scores:
-            for score in scores:
-                # Insert into the SQLite database
-                c.execute('INSERT INTO similarity_scores (filename, function_name, similarity) VALUES (?, ?, ?)',
-                          (result_file, score[0], score[1]))
-            conn.commit()
+# Identify common .BinExport files
+common_files = None
+for directory in directories:
+    full_dir = os.path.join(base_path, directory)
+    if os.path.isdir(full_dir):
+        binexport_files = {f for f in os.listdir(full_dir) if f.endswith('.BinExport')}
+        if common_files is None:
+            common_files = binexport_files
         else:
-            print(f"No function similarity scores found in: {result_file}")
+            common_files &= binexport_files
 
-# Query the database to retrieve the similarity scores
-query = "SELECT function_name, similarity FROM similarity_scores"
-df_db = pd.read_sql_query(query, conn)
+# Debug: Print common files
+print("Common .BinExport files across all directories:")
+print(common_files)
 
-# Print the DataFrame with the similarity scores from the database
-print(df_db)
+# Aggregate similarity scores between folders
+folder_pairs = {}
+for i, dir1 in enumerate(directories):
+    for j, dir2 in enumerate(directories):
+        if i < j:
+            folder_pairs[(dir1, dir2)] = []
 
-# Close the database connection
-conn.close()
+for file in common_files:
+    binaries = {directory: os.path.join(base_path, directory, file) for directory in directories}
+    for (dir1, dir2), _ in folder_pairs.items():
+        primary = binaries[dir1]
+        secondary = binaries[dir2]
+        output_file, output_content, error_content = run_bindiff(primary, secondary, output_dir)
+        print(f"BinDiff output for {primary} vs {secondary}:")
+        print(output_content)
+        if error_content:
+            print(f"BinDiff error for {primary} vs {secondary}:")
+            print(error_content)
+        score = extract_similarity_score(output_content)
+        if score is not None:
+            folder_pairs[(dir1, dir2)].append(score)
 
-# Calculate standard deviation of similarity scores for each function
-df_std = df_db.groupby('function_name').agg({'similarity': ['std', 'count']}).reset_index()
-df_std.columns = ['function_name', 'std_dev', 'count']
+# Calculate average similarity scores for each folder pair
+average_similarity_scores = {pair: np.mean(scores) for pair, scores in folder_pairs.items() if scores}
 
-# Set a minimum number of data points required to include a function
-min_data_points = 3
+# Debug: Print average similarity scores
+print("Average similarity scores between folder pairs:")
+for pair, score in average_similarity_scores.items():
+    print(f"{pair}: {score}")
 
-# Filter out functions with fewer data points than the threshold
-df_std_filtered = df_std[df_std['count'] >= min_data_points]
+# Create a list of folder names
+folder_names = [directory for directory in directories]
 
-# Print distribution of standard deviations
-print(df_std_filtered.describe())
+# Initialize an empty similarity matrix
+n = len(folder_names)
+similarity_matrix = np.zeros((n, n))
 
-# Plot distribution of standard deviations
-plt.figure(figsize=(10, 6))
-sns.histplot(df_std_filtered['std_dev'], bins=50, kde=True)
-plt.title('Distribution of Standard Deviations of Function Similarity Scores')
-plt.xlabel('Standard Deviation')
-plt.ylabel('Frequency')
-plt.show()
+# Fill the similarity matrix with average scores
+for (dir1, dir2), score in average_similarity_scores.items():
+    i = directories.index(dir1)
+    j = directories.index(dir2)
+    similarity_matrix[i, j] = score
+    similarity_matrix[j, i] = score
 
-# Adjust the threshold for filtering
-threshold = 0.005  # Adjust this value based on the distribution
-df_std_filtered = df_std_filtered[df_std_filtered['std_dev'] > threshold]
+# Debug: Print the similarity matrix
+print("Similarity matrix:")
+print(similarity_matrix)
 
-# Plotting the standard deviation of similarity scores
-plt.figure(figsize=(12, 8))
-sns.barplot(x='std_dev', y='function_name', data=df_std_filtered, palette='viridis')
-plt.title('Standard Deviation of Function Similarity Scores')
-plt.xlabel('Standard Deviation')
-plt.ylabel('Function Name')
-plt.xticks(rotation=90)
-plt.tight_layout()
-plt.show()
+# Transform similarity matrix to distance matrix
+distance_matrix = 1 - (similarity_matrix / 100.0)
+
+# Ensure diagonal is zero
+np.fill_diagonal(distance_matrix, 0)
+
+# Debug: Print the distance matrix
+print("Distance matrix:")
+print(distance_matrix)
+
+# Perform MDS
+if len(distance_matrix) > 0 and np.any(distance_matrix):
+    mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42)
+    mds_coords = mds.fit_transform(distance_matrix)
+
+    # Create a DataFrame with the MDS results
+    mds_df = pd.DataFrame(mds_coords, index=folder_names, columns=['MDS1', 'MDS2'])
+
+    # Plot the MDS results with enhancements
+    plt.figure(figsize=(14, 10))
+    scatter = sns.scatterplot(data=mds_df, x='MDS1', y='MDS2', palette='viridis', s=100)
+
+    # Annotate points with folder names
+    for folder, row in mds_df.iterrows():
+        plt.text(row['MDS1'], row['MDS2'], folder, fontsize=9, ha='right')
+
+    plt.title('MDS Plot of Folder Distances Based on BinDiff Similarities', fontsize=15)
+    plt.xlabel('MDS Dimension 1', fontsize=12)
+    plt.ylabel('MDS Dimension 2', fontsize=12)
+
+    # Adjust legend to show on the right side
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Distance matrix is empty or invalid, MDS cannot be performed.")
